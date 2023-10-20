@@ -96,6 +96,9 @@ type Session struct {
 	// sendCh is used to send messages
 	sendCh chan []byte
 
+	// highPrioSendCh is used to send messages for streams marked high priority.
+	highPrioSendCh chan []byte
+
 	// pingCh and pingCh are used to send pings and pongs
 	pongCh, pingCh chan uint32
 
@@ -144,6 +147,7 @@ func newSession(config *Config, conn net.Conn, client bool, readBuf int, newMemo
 		synCh:            make(chan struct{}, config.AcceptBacklog),
 		acceptCh:         make(chan *Stream, config.AcceptBacklog),
 		sendCh:           make(chan []byte, 64),
+		highPrioSendCh:   make(chan []byte, 64),
 		pongCh:           make(chan uint32, config.PingBacklog),
 		pingCh:           make(chan uint32),
 		recvDoneCh:       make(chan struct{}),
@@ -326,7 +330,7 @@ func (s *Session) exitErr(err error) {
 // GoAway can be used to prevent accepting further
 // connections. It does not close the underlying conn.
 func (s *Session) GoAway() error {
-	return s.sendMsg(s.goAway(goAwayNormal), nil, nil)
+	return s.sendMsg(s.goAway(goAwayNormal), nil, nil, false)
 }
 
 // goAway is used to send a goAway message
@@ -483,7 +487,7 @@ func (s *Session) extendKeepalive() {
 }
 
 // send sends the header and body.
-func (s *Session) sendMsg(hdr header, body []byte, deadline <-chan struct{}) error {
+func (s *Session) sendMsg(hdr header, body []byte, deadline <-chan struct{}, highPriority bool) error {
 	select {
 	case <-s.shutdownCh:
 		return s.shutdownErr
@@ -495,11 +499,16 @@ func (s *Session) sendMsg(hdr header, body []byte, deadline <-chan struct{}) err
 	copy(buf[:headerSize], hdr[:])
 	copy(buf[headerSize:], body)
 
+	sendCh := s.sendCh
+	if highPriority {
+		sendCh = s.highPrioSendCh
+	}
+
 	select {
 	case <-s.shutdownCh:
 		pool.Put(buf)
 		return s.shutdownErr
-	case s.sendCh <- buf:
+	case sendCh <- buf:
 		return nil
 	case <-deadline:
 		pool.Put(buf)
@@ -579,9 +588,9 @@ func (s *Session) sendLoop() (err error) {
 			hdr := encode(typePing, flagACK, 0, pingID)
 			copy(buf, hdr[:])
 		default:
-			// Then send normal data.
+			// Next, the highPrioSendCh gets to send before other streams, if data is available.
 			select {
-			case buf = <-s.sendCh:
+			case buf = <-s.highPrioSendCh:
 			case pingID := <-s.pingCh:
 				buf = pool.Get(headerSize)
 				hdr := encode(typePing, flagSYN, 0, pingID)
@@ -590,8 +599,22 @@ func (s *Session) sendLoop() (err error) {
 				buf = pool.Get(headerSize)
 				hdr := encode(typePing, flagACK, 0, pingID)
 				copy(buf, hdr[:])
-			case <-s.shutdownCh:
-				return nil
+			default:
+				// Then send normal data.
+				select {
+				case buf = <-s.highPrioSendCh:
+				case buf = <-s.sendCh:
+				case pingID := <-s.pingCh:
+					buf = pool.Get(headerSize)
+					hdr := encode(typePing, flagSYN, 0, pingID)
+					copy(buf, hdr[:])
+				case pingID := <-s.pongCh:
+					buf = pool.Get(headerSize)
+					hdr := encode(typePing, flagACK, 0, pingID)
+					copy(buf, hdr[:])
+				case <-s.shutdownCh:
+					return nil
+				}
 				// default:
 				//	select {
 				//	case buf = <-s.sendCh:
@@ -734,7 +757,7 @@ func (s *Session) handleStreamMessage(hdr header) error {
 
 	// Read the new data
 	if err := stream.readData(hdr, flags, s.reader); err != nil {
-		if sendErr := s.sendMsg(s.goAway(goAwayProtoErr), nil, nil); sendErr != nil {
+		if sendErr := s.sendMsg(s.goAway(goAwayProtoErr), nil, nil, false); sendErr != nil {
 			s.logger.Printf("[WARN] yamux: failed to send go away: %v", sendErr)
 		}
 		return err
@@ -802,7 +825,7 @@ func (s *Session) incomingStream(id uint32) error {
 	// Reject immediately if we are doing a go away
 	if atomic.LoadInt32(&s.localGoAway) == 1 {
 		hdr := encode(typeWindowUpdate, flagRST, id, 0)
-		return s.sendMsg(hdr, nil, nil)
+		return s.sendMsg(hdr, nil, nil, false)
 	}
 
 	// Allocate a new stream
@@ -821,7 +844,7 @@ func (s *Session) incomingStream(id uint32) error {
 	// Check if stream already exists
 	if _, ok := s.streams[id]; ok {
 		s.logger.Printf("[ERR] yamux: duplicate stream declared")
-		if sendErr := s.sendMsg(s.goAway(goAwayProtoErr), nil, nil); sendErr != nil {
+		if sendErr := s.sendMsg(s.goAway(goAwayProtoErr), nil, nil, false); sendErr != nil {
 			s.logger.Printf("[WARN] yamux: failed to send go away: %v", sendErr)
 		}
 		span.Done()
@@ -833,7 +856,7 @@ func (s *Session) incomingStream(id uint32) error {
 		s.logger.Printf("[WARN] yamux: MaxIncomingStreams exceeded, forcing stream reset")
 		defer span.Done()
 		hdr := encode(typeWindowUpdate, flagRST, id, 0)
-		return s.sendMsg(hdr, nil, nil)
+		return s.sendMsg(hdr, nil, nil, false)
 	}
 
 	s.numIncomingStreams++
@@ -850,7 +873,7 @@ func (s *Session) incomingStream(id uint32) error {
 		s.logger.Printf("[WARN] yamux: backlog exceeded, forcing stream reset")
 		s.deleteStream(id)
 		hdr := encode(typeWindowUpdate, flagRST, id, 0)
-		return s.sendMsg(hdr, nil, nil)
+		return s.sendMsg(hdr, nil, nil, false)
 	}
 }
 

@@ -1322,7 +1322,7 @@ func TestSession_sendMsg_Timeout(t *testing.T) {
 
 	hdr := encode(typePing, flagACK, 0, 0)
 	for {
-		err := client.sendMsg(hdr, nil, nil)
+		err := client.sendMsg(hdr, nil, nil, false)
 		if err == nil {
 			continue
 		} else if err == ErrConnectionWriteTimeout {
@@ -1345,14 +1345,14 @@ func TestWindowOverflow(t *testing.T) {
 			defer server.Close()
 
 			hdr1 := encode(typeData, flagSYN, i, 0)
-			_ = client.sendMsg(hdr1, nil, nil)
+			_ = client.sendMsg(hdr1, nil, nil, false)
 			s, err := server.AcceptStream()
 			if err != nil {
 				t.Fatal(err)
 			}
 			msg := make([]byte, client.config.MaxStreamWindowSize*2)
 			hdr2 := encode(typeData, 0, i, uint32(len(msg)))
-			_ = client.sendMsg(hdr2, msg, nil)
+			_ = client.sendMsg(hdr2, msg, nil, false)
 			_, err = io.ReadAll(s)
 			if err == nil {
 				t.Fatal("expected to read no data")

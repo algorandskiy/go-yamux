@@ -26,6 +26,11 @@ const (
 	halfReset
 )
 
+// HighPriorityWriteDeadlineMagicValue is a special value that can be passed to
+// SetWriteDeadline to indicate that this stream should get to send its data
+// before other streams.
+var HighPriorityWriteDeadlineMagicValue = time.Unix(1<<60, 0)
+
 // Stream is used to represent a logical stream
 // within a session.
 type Stream struct {
@@ -49,6 +54,8 @@ type Stream struct {
 	sendNotifyCh chan struct{}
 
 	readDeadline, writeDeadline pipeDeadline
+
+	highPriority bool
 }
 
 // newStream is used to construct a new stream within a given session for an ID.
@@ -70,6 +77,7 @@ func newStream(session *Session, id uint32, state streamState, initialWindow uin
 		epochStart:   time.Now(),
 		recvNotifyCh: make(chan struct{}, 1),
 		sendNotifyCh: make(chan struct{}, 1),
+		highPriority: false,
 	}
 	return s
 }
@@ -179,7 +187,7 @@ START:
 
 	// Send the header
 	hdr = encode(typeData, flags, s.id, max)
-	if err = s.session.sendMsg(hdr, b[:max], s.writeDeadline.wait()); err != nil {
+	if err = s.session.sendMsg(hdr, b[:max], s.writeDeadline.wait(), s.highPriority); err != nil {
 		return 0, err
 	}
 
@@ -238,7 +246,7 @@ func (s *Stream) sendWindowUpdate(deadline <-chan struct{}) error {
 
 	s.epochStart = now
 	hdr := encode(typeWindowUpdate, flags, s.id, delta)
-	return s.session.sendMsg(hdr, nil, deadline)
+	return s.session.sendMsg(hdr, nil, deadline, s.highPriority)
 }
 
 // sendClose is used to send a FIN
@@ -246,13 +254,13 @@ func (s *Stream) sendClose() error {
 	flags := s.sendFlags()
 	flags |= flagFIN
 	hdr := encode(typeWindowUpdate, flags, s.id, 0)
-	return s.session.sendMsg(hdr, nil, nil)
+	return s.session.sendMsg(hdr, nil, nil, s.highPriority)
 }
 
 // sendReset is used to send a RST
 func (s *Stream) sendReset() error {
 	hdr := encode(typeWindowUpdate, flagRST, s.id, 0)
-	return s.session.sendMsg(hdr, nil, nil)
+	return s.session.sendMsg(hdr, nil, nil, s.highPriority)
 }
 
 // Reset resets the stream (forcibly closes the stream)
@@ -490,7 +498,10 @@ func (s *Stream) SetReadDeadline(t time.Time) error {
 func (s *Stream) SetWriteDeadline(t time.Time) error {
 	s.stateLock.Lock()
 	defer s.stateLock.Unlock()
-	if s.writeState == halfOpen {
+	// handle magic time.Time value to signal this is a high-priority stream.
+	if t.Equal(HighPriorityWriteDeadlineMagicValue) {
+		s.highPriority = true
+	} else if s.writeState == halfOpen {
 		s.writeDeadline.set(t)
 	}
 	return nil
