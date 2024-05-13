@@ -1,4 +1,4 @@
-module github.com/libp2p/go-yamux/v4
+module github.com/pzbitskiy/go-yamux/v4
 
 go 1.20
 
