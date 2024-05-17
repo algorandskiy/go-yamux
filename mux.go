@@ -63,10 +63,6 @@ type Config struct {
 	// MaxMessageSize is the maximum size of a message that we'll send on a
 	// stream. This ensures that a single stream doesn't hog a connection.
 	MaxMessageSize uint32
-
-	// MaxHighPrioMessageSize is the maximum size of a message that we'll send on a
-	// highprio stream. This ensures that a single stream doesn't hog a connection.
-	MaxHighPrioMessageSize uint32
 }
 
 // DefaultConfig is used to return a default configuration
@@ -84,7 +80,6 @@ func DefaultConfig() *Config {
 		LogOutput:               os.Stderr,
 		ReadBufSize:             4096,
 		MaxMessageSize:          64 * 1024,
-		MaxHighPrioMessageSize:  6 * 1024 * 1024,
 		WriteCoalesceDelay:      100 * time.Microsecond,
 	}
 }
@@ -109,9 +104,6 @@ func VerifyConfig(config *Config) error {
 	}
 	if config.MaxMessageSize < 1024 {
 		return fmt.Errorf("MaxMessageSize must be greater than a kilobyte")
-	}
-	if config.MaxHighPrioMessageSize < 1024 {
-		return fmt.Errorf("MaxHighPrioMessageSize must be greater than a kilobyte")
 	}
 	if config.WriteCoalesceDelay < 0 {
 		return fmt.Errorf("WriteCoalesceDelay must be >= 0")
