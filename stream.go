@@ -3,9 +3,12 @@ package yamux
 import (
 	"io"
 	"math"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type streamState int
@@ -56,6 +59,69 @@ type Stream struct {
 	readDeadline, writeDeadline pipeDeadline
 
 	highPriority bool
+
+	// pre-cached values for metrics
+	connId string
+	sid    string
+	hp     string
+}
+
+const metricNamespace = "libp2p_yamux"
+
+var windowSizeGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "window_size",
+	Help:      "Window size of a stream",
+}, []string{"con", "sid"})
+
+var connStreamsGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "streams",
+	Help:      "Number of Streams in a session",
+}, []string{"con"})
+
+var highPrioStreamsGauge = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Namespace: metricNamespace,
+		Name:      "high_prio_streams",
+		Help:      "Number of HP Streams",
+	},
+)
+
+var numWritesCounter = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "writes_total",
+		Help:      "Number of writes to a stream",
+	},
+	[]string{"con", "sid", "prio"},
+)
+
+var numChunkWritesCounter = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "chunk_writes_total",
+		Help:      "Number of writes to a stream",
+	},
+	[]string{"con", "sid", "prio"},
+)
+
+var bytesCounter = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "bytes_total",
+		Help:      "Number of writes to a stream",
+	},
+	[]string{"con", "sid", "prio"},
+)
+
+func init() {
+	prometheus.MustRegister(windowSizeGauge)
+	prometheus.MustRegister(connStreamsGauge)
+	prometheus.MustRegister(highPrioStreamsGauge)
+	prometheus.MustRegister(numWritesCounter)
+	prometheus.MustRegister(numChunkWritesCounter)
+	prometheus.MustRegister(bytesCounter)
 }
 
 // newStream is used to construct a new stream within a given session for an ID.
@@ -78,7 +144,13 @@ func newStream(session *Session, id uint32, state streamState, initialWindow uin
 		recvNotifyCh: make(chan struct{}, 1),
 		sendNotifyCh: make(chan struct{}, 1),
 		highPriority: false,
+		connId:       session.conn.RemoteAddr().String(),
+		sid:          strconv.Itoa(int(id)),
+		hp:           "",
 	}
+
+	connStreamsGauge.WithLabelValues(s.connId).Inc()
+	highPrioStreamsGauge.Inc()
 	return s
 }
 
@@ -135,6 +207,7 @@ START:
 // Write is used to write to the stream
 func (s *Stream) Write(b []byte) (int, error) {
 	var total int
+	numWritesCounter.WithLabelValues(s.connId, s.sid, s.hp).Inc()
 	for total < len(b) {
 		n, err := s.write(b[total:])
 		total += n
@@ -142,6 +215,7 @@ func (s *Stream) Write(b []byte) (int, error) {
 			return total, err
 		}
 	}
+	bytesCounter.WithLabelValues(s.connId, s.sid, s.hp).Add(float64(total))
 	return total, nil
 }
 
@@ -183,6 +257,7 @@ START:
 	flags = s.sendFlags()
 
 	// Send up to min(message, window)
+	numChunkWritesCounter.WithLabelValues(s.connId, s.sid, s.hp).Inc()
 	max = min(window, s.session.config.MaxMessageSize-headerSize, uint32(len(b)))
 
 	// Send the header
@@ -360,6 +435,8 @@ func (s *Stream) CloseRead() error {
 
 // Close is used to close the stream.
 func (s *Stream) Close() error {
+	connStreamsGauge.WithLabelValues(s.connId).Dec()
+	highPrioStreamsGauge.Dec()
 	_ = s.CloseRead() // can't fail.
 	return s.CloseWrite()
 }
@@ -449,7 +526,8 @@ func (s *Stream) notifyWaiting() {
 func (s *Stream) incrSendWindow(hdr header, flags uint16) {
 	s.processFlags(flags)
 	// Increase window, unblock a sender
-	atomic.AddUint32(&s.sendWindow, hdr.Length())
+	val := atomic.AddUint32(&s.sendWindow, hdr.Length())
+	windowSizeGauge.WithLabelValues(s.connId, s.sid).Set(float64(val))
 	asyncNotify(s.sendNotifyCh)
 }
 
@@ -501,6 +579,7 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 	// handle magic time.Time value to signal this is a high-priority stream.
 	if t.Equal(HighPriorityWriteDeadlineMagicValue) {
 		s.highPriority = true
+		s.hp = strconv.FormatBool(true)
 	} else if s.writeState == halfOpen {
 		s.writeDeadline.set(t)
 	}
